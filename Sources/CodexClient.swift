@@ -144,7 +144,7 @@ enum CodexClient {
         defer { connection.stop() }
         let deadline = Date().addingTimeInterval(timeout)
         _ = try connection.request(id: 1, method: "initialize", params: [
-            "clientInfo": ["name": "codex_quota_bar", "title": "Codex Quota Bar", "version": "1.0.0"]
+            "clientInfo": ["name": "codex_quota_bar", "title": "Codex Quota Bar", "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.2.1"]
         ], deadline: deadline)
         try connection.send(["method": "initialized", "params": [:]])
         let data = try connection.request(id: 2, method: "account/rateLimits/read", deadline: deadline)

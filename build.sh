@@ -10,7 +10,7 @@ xcrun swiftc -swift-version 5 -O \
   -target "${arch}-apple-macosx13.0" \
   -module-cache-path "$build_dir/module-cache" \
   -framework AppKit -framework SwiftUI -framework ServiceManagement \
-  Sources/QuotaModels.swift Sources/CodexClient.swift Sources/QuotaApp.swift Sources/main.swift \
+  Sources/QuotaModels.swift Sources/CodexClient.swift Sources/SessionFileWatcher.swift Sources/RunMetrics.swift Sources/QuotaApp.swift Sources/main.swift \
   -o "$app/Contents/MacOS/CodexQuotaBar"
 cp Info.plist "$app/Contents/Info.plist"
 codesign --force --sign - "$app"

@@ -8,16 +8,21 @@ final class QuotaStore: ObservableObject {
     @Published private(set) var snapshot: QuotaSnapshot?
     @Published private(set) var isRefreshing = false
     @Published private(set) var error: String?
+    @Published private(set) var activity: RunActivity
     @Published var showUsed = UserDefaults.standard.bool(forKey: "showUsed") {
         didSet { UserDefaults.standard.set(showUsed, forKey: "showUsed"); onChange?() }
     }
     @Published private(set) var loginEnabled = SMAppService.mainApp.status == .enabled
     @Published private(set) var loginMessage: String?
     var onChange: (() -> Void)?
+    var onActivityChange: (() -> Void)?
     private var timer: Timer?
+    private var activityMonitor: RunMetricsMonitor?
+    private var monitoringID: UUID?
 
-    init(snapshot: QuotaSnapshot? = nil) {
+    init(snapshot: QuotaSnapshot? = nil, activity: RunActivity = .empty) {
         self.snapshot = snapshot
+        self.activity = activity
     }
 
     var needsSync: Bool { error != nil || snapshot?.hasExpiredWindow == true }
@@ -28,11 +33,30 @@ final class QuotaStore: ObservableObject {
     }
 
     func start() {
+        guard timer == nil else { return }
+        let monitoringID = UUID()
+        self.monitoringID = monitoringID
+        activityMonitor = RunMetricsMonitor { [weak self] activity in
+            MainActor.assumeIsolated {
+                guard let self, self.monitoringID == monitoringID, !self.activity.hasSameDisplay(as: activity) else { return }
+                self.activity = activity
+                self.onActivityChange?()
+            }
+        }
+        activityMonitor?.start()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
-        if let timer { RunLoop.main.add(timer, forMode: .common) }
+        if let timer { timer.tolerance = 6; RunLoop.main.add(timer, forMode: .common) }
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+        monitoringID = nil
+        activityMonitor?.stop()
+        activityMonitor = nil
     }
 
     func refresh() {
@@ -93,6 +117,47 @@ final class QuotaStore: ObservableObject {
     func useAutomaticPath() {
         UserDefaults.standard.removeObject(forKey: "codexPath")
         refresh()
+    }
+}
+
+private struct LastRunCard: View {
+    let activity: RunActivity
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("上一轮").font(.system(size: 11, weight: .medium))
+                if let run = activity.lastCompleted {
+                    Text(run.completedAt, format: .dateTime.hour().minute()).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text(activity.activeCount > 1 ? "\(activity.activeCount) 个任务运行中" : activity.displayStatus.title)
+                    .foregroundStyle(Color(MenuStatusPalette.indicator(activity.displayStatus, dark: colorScheme == .dark)))
+            }
+            .font(.system(size: 10))
+            HStack(spacing: 12) {
+                metric("平均速率", value: RunFormatting.rate(activity.lastCompleted?.averageRate))
+                Divider().frame(height: 30)
+                metric("首 Token 延迟", value: RunFormatting.latency(activity.lastCompleted?.firstTokenMilliseconds))
+            }
+            Text(activity.notice ?? "平均速率含等待与工具耗时 · 运行中保留上一轮")
+                .font(.system(size: 9.5)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.5))
+        .help("数值保留上一轮成功完成任务的统计。速率为输出 Token 数除以整轮耗时的估算平均值，包含等待与工具耗时。延迟采用 Codex 记录的首 Token 延迟，缺失时显示 —。多个任务运行时，菜单栏显示最近启动任务的速率。")
+    }
+
+    private func metric(_ title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.system(size: 10)).foregroundStyle(.secondary)
+            Text(verbatim: value).font(.system(size: 19)).monospacedDigit()
+                .lineLimit(1).minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -207,6 +272,9 @@ struct QuotaPopover: View {
             .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 14)
 
+            LastRunCard(activity: store.activity)
+                .padding(.horizontal, 14)
+
             if let error = store.error {
                 HStack(alignment: .top, spacing: 7) {
                     Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
@@ -265,12 +333,50 @@ struct QuotaPopover: View {
     }
 }
 
+enum MenuStatusPalette {
+    static func color(_ rgb: UInt32) -> NSColor {
+        NSColor(srgbRed: CGFloat((rgb >> 16) & 255) / 255,
+                green: CGFloat((rgb >> 8) & 255) / 255, blue: CGFloat(rgb & 255) / 255, alpha: 1)
+    }
+
+    static func background(dark: Bool) -> NSColor { color(dark ? 0x202329 : 0xF6F7F9) }
+
+    static func fill(_ status: RunStatus, dark: Bool) -> NSColor? {
+        let rgb: UInt32
+        switch status {
+        case .idle: return nil
+        case .running: rgb = dark ? 0x163C60 : 0xD9EAFE
+        case .completed: rgb = dark ? 0x173F2C : 0xDDF2E5
+        case .cancelled: rgb = dark ? 0x493D13 : 0xFFF0BC
+        case .failed: rgb = dark ? 0x4F2429 : 0xFCE0E2
+        case .unavailable: rgb = dark ? 0x51351B : 0xFFE5CD
+        }
+        return color(rgb)
+    }
+
+    static func indicator(_ status: RunStatus, dark: Bool) -> NSColor {
+        let rgb: UInt32
+        switch status {
+        case .idle: rgb = dark ? 0xABB3C0 : 0x707780
+        case .running: rgb = dark ? 0x5CB1FF : 0x0066D6
+        case .completed: rgb = dark ? 0x45DA84 : 0x118144
+        case .cancelled: rgb = dark ? 0xFFD84D : 0x9C7200
+        case .failed: rgb = dark ? 0xFF6A73 : 0xC52632
+        case .unavailable: rgb = dark ? 0xFFAA4D : 0xBF5900
+        }
+        return color(rgb)
+    }
+}
+
 @MainActor
 final class StatusTextView: NSView {
-    private let font = NSFont.systemFont(ofSize: 15, weight: .regular)
+    private let font = NSFont.systemFont(ofSize: 13, weight: .regular)
     private var values: [Double?] = [nil, nil]
     private var labels = ["—", "—"]
     private var needsSync = false
+    private var showingRate = false
+    private(set) var displayedStatus: RunStatus = .idle
+    var displayedLabels: [String] { labels }
 
     private func textSize(_ text: String) -> NSSize {
         (text as NSString).size(withAttributes: [.font: font])
@@ -281,19 +387,28 @@ final class StatusTextView: NSView {
         max(44, ceil(labels.map { textSize($0).width }.max() ?? 0) + 8)
     }
 
+    private var leftWidth: CGFloat { showingRate ? max(44, ceil(textSize(labels[0]).width) + 8) : columnWidth }
+    private var rightWidth: CGFloat { showingRate ? max(44, ceil(textSize(labels[1]).width) + 8) : columnWidth }
+
     private var syncWidth: CGFloat { needsSync ? ceil(textSize("!").width) + 6 : 0 }
 
-    func update(fiveHour: LimitWindow?, weekly: LimitWindow?, showUsed: Bool, needsSync: Bool = false) {
+    func update(fiveHour: LimitWindow?, weekly: LimitWindow?, showUsed: Bool, needsSync: Bool = false, activity: RunActivity = .empty) {
         let windows = [fiveHour, weekly]
         values = windows.map { showUsed ? $0?.used : $0?.remaining }
         labels = windows.map { $0?.percentage(showUsed: showUsed) ?? "—" }
+        showingRate = activity.activeCount > 0
+        if let rate = activity.menuLabel {
+            labels[1] = rate
+            values[1] = nil
+        }
         self.needsSync = needsSync
+        displayedStatus = activity.displayStatus
         invalidateIntrinsicContentSize()
         needsDisplay = true
     }
 
     override var intrinsicContentSize: NSSize {
-        NSSize(width: 2 + columnWidth * 2 + syncWidth, height: NSStatusBar.system.thickness)
+        NSSize(width: 2 + leftWidth + rightWidth + syncWidth, height: NSStatusBar.system.thickness)
     }
 
     // Leave the complete status button as the click and accessibility target.
@@ -305,14 +420,20 @@ final class StatusTextView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        let dark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
         let height = min(20.5, max(0, bounds.height - 2))
-        let borderRect = NSRect(x: bounds.minX + 0.5, y: bounds.midY - height / 2, width: max(0, bounds.width - 1), height: height)
+        let borderRect = NSRect(x: bounds.minX + 0.5, y: bounds.midY - height / 2,
+                                width: max(0, bounds.width - 1), height: height)
         let border = NSBezierPath(roundedRect: borderRect, xRadius: 3.5, yRadius: 3.5)
+        if let fill = MenuStatusPalette.fill(displayedStatus, dark: dark) {
+            fill.setFill()
+            border.fill()
+        }
         NSColor.labelColor.withAlphaComponent(0.30).setStroke()
         border.lineWidth = 0.5
         border.stroke()
 
-        let dividerX = bounds.minX + 1 + columnWidth
+        let dividerX = bounds.minX + 1 + leftWidth
         let divider = NSBezierPath()
         divider.move(to: NSPoint(x: dividerX, y: bounds.midY - 5))
         divider.line(to: NSPoint(x: dividerX, y: bounds.midY + 5))
@@ -322,11 +443,11 @@ final class StatusTextView: NSView {
         divider.stroke()
 
         for index in labels.indices {
-            let centerX = bounds.minX + 1 + columnWidth * (CGFloat(index) + 0.5)
+            let centerX = bounds.minX + 1 + (index == 0 ? leftWidth / 2 : leftWidth + rightWidth / 2)
             drawLabel(labels[index], centerX: centerX, color: metricColor(values[index]))
         }
         if needsSync {
-            drawLabel("!", centerX: bounds.minX + 1 + columnWidth * 2 + syncWidth / 2, color: .labelColor)
+            drawLabel("!", centerX: bounds.minX + 1 + leftWidth + rightWidth + syncWidth / 2, color: .labelColor)
         }
     }
 
@@ -340,7 +461,10 @@ final class StatusTextView: NSView {
         guard let value, value <= 20 else { return .labelColor }
         let dark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
         let rgb: UInt32
-        if value < 10 { rgb = dark ? 0xFF6961 : 0xD23536 }
+        if displayedStatus != .idle {
+            if value < 10 { rgb = dark ? 0xFF9293 : 0xB1202A }
+            else { rgb = dark ? 0xFFD45C : 0x7D5A00 }
+        } else if value < 10 { rgb = dark ? 0xFF6961 : 0xD23536 }
         else { rgb = dark ? 0xFFD45C : 0x987600 }
         return NSColor(srgbRed: CGFloat((rgb >> 16) & 255) / 255,
                        green: CGFloat((rgb >> 8) & 255) / 255,
@@ -423,10 +547,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var item: NSStatusItem!
     private let statusText = StatusTextView()
     private var panel: QuotaPanel!
-    private var measurementView: NSHostingView<QuotaPopover>!
     private var panelContent: NSHostingView<AnyView>!
     private let store = QuotaStore()
     private var wakeObserver: NSObjectProtocol?
+    private var sleepObserver: NSObjectProtocol?
     private var observers: [NSObjectProtocol] = []
     private var localMonitor: Any?
     private var globalMonitor: Any?
@@ -454,10 +578,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.updateStatus()
             if self?.panel.isVisible == true { self?.positionPanel() }
         }
+        store.onActivityChange = { [weak self] in self?.updateStatus() }
         updateStatus()
         store.start()
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.store.refresh() }
+            Task { @MainActor in self?.store.start() }
+        }
+        sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.closePanel(); self?.store.stop() }
         }
         observe(NSApplication.didResignActiveNotification) { [weak self] in self?.closePanel() }
         observe(NSApplication.didChangeScreenParametersNotification) { [weak self] in
@@ -468,12 +596,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateStatus() {
-        statusText.update(fiveHour: store.snapshot?.fiveHour, weekly: store.snapshot?.weekly, showUsed: store.showUsed, needsSync: store.needsSync)
-        item.length = statusText.intrinsicContentSize.width
+        statusText.update(fiveHour: store.snapshot?.fiveHour, weekly: store.snapshot?.weekly, showUsed: store.showUsed, needsSync: store.needsSync, activity: store.activity)
+        let width = statusText.intrinsicContentSize.width
+        if item.length != width { item.length = width }
         let mode = store.showUsed ? "已用" : "剩余"
-        item.button?.toolTip = "Codex \(mode)额度 · \(store.statusDescription)\(store.needsSync ? " · 数据待同步" : "")"
+        let running = store.activity.activeCount > 0
+            ? " · \(store.activity.activeCount) 个任务运行中 · 当前平均速率 \(RunFormatting.rate(store.activity.currentRate))（含等待与工具耗时）" : ""
+        item.button?.toolTip = "Codex · \(store.activity.displayStatus.title) · \(mode)额度 · \(store.statusDescription)\(running)\(store.needsSync ? " · 数据待同步" : "")"
         item.button?.setAccessibilityLabel(item.button?.toolTip)
     }
+
+    func applicationWillTerminate(_ notification: Notification) { store.stop() }
 
     private func configurePanel() {
         panel = QuotaPanel(contentRect: .zero, styleMask: [.borderless], backing: .buffered, defer: true)
@@ -489,7 +622,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let surface = RoundedPanelView(frame: .zero)
         panel.contentView = surface
 
-        measurementView = NSHostingView(rootView: QuotaPopover(store: store))
         panelContent = NSHostingView(rootView: AnyView(EmptyView()))
         panelContent.translatesAutoresizingMaskIntoConstraints = false
         surface.addSubview(panelContent)
@@ -505,7 +637,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = item.button, let statusWindow = button.window,
               let screen = statusWindow.screen else { return }
         let anchor = statusWindow.convertToScreen(button.convert(button.bounds, to: nil))
-        measurementView.rootView = QuotaPopover(store: store)
+        let measurementView = NSHostingView(rootView: QuotaPopover(store: store))
         measurementView.layoutSubtreeIfNeeded()
         let size = measurementView.fittingSize
         let frame = QuotaPanelLayout.frame(contentSize: NSSize(width: 340, height: ceil(size.height)), anchor: anchor, visibleFrame: screen.visibleFrame)
@@ -531,6 +663,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func closePanel() {
         panel.orderOut(nil)
+        // Hidden panels must not keep TimelineViews or store subscriptions alive.
+        panelContent.rootView = AnyView(EmptyView())
+        panelContent.layoutSubtreeIfNeeded()
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
         localMonitor = nil

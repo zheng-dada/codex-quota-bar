@@ -39,6 +39,36 @@ MainActor.assumeIsolated {
     check(statusText.intrinsicContentSize.width > 60 && statusText.intrinsicContentSize.width < 220, "compact status text fits both percentages")
     check(statusText.hitTest(.zero) == nil, "status text leaves click handling to status button")
 
+    statusText.update(fiveHour: store.snapshot?.fiveHour, weekly: store.snapshot?.weekly, showUsed: false, activity: RunActivity(activeCount: 1, currentRate: 38))
+    check(statusText.displayedLabels == ["51%", "38t/s"], "running speed replaces weekly cell and preserves five-hour quota")
+    check(statusText.intrinsicContentSize.width < 160, "running speed fits a compact two-cell menu bar")
+    statusText.update(fiveHour: store.snapshot?.fiveHour, weekly: store.snapshot?.weekly, showUsed: false, activity: RunActivity(activeCount: 1))
+    check(statusText.displayedLabels == ["51%", "…"], "running without a sample shows ellipsis")
+    statusText.update(fiveHour: store.snapshot?.fiveHour, weekly: store.snapshot?.weekly, showUsed: false)
+    check(statusText.displayedLabels == ["51%", "85%"], "completion restores weekly percentage")
+    statusText.update(fiveHour: store.snapshot?.fiveHour, weekly: store.snapshot?.weekly, showUsed: true, needsSync: true, activity: RunActivity(activeCount: 2, currentRate: 0.05))
+    check(statusText.displayedLabels == ["49%", "<0.1t/s"], "used mode and sync marker do not change the rate meaning")
+
+    func luminance(_ color: NSColor) -> Double {
+        let rgb = color.usingColorSpace(.sRGB)!
+        func linear(_ value: CGFloat) -> Double {
+            let value = Double(value)
+            return value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
+        }
+        return linear(rgb.redComponent) * 0.2126 + linear(rgb.greenComponent) * 0.7152 + linear(rgb.blueComponent) * 0.0722
+    }
+    for dark in [false, true] {
+        let text = luminance(dark ? .white : .black)
+        for state in RunStatus.allCases {
+            statusText.update(fiveHour: store.snapshot?.fiveHour, weekly: store.snapshot?.weekly, showUsed: false,
+                              activity: RunActivity(activeCount: state == .running ? 1 : 0, currentRate: 38, status: state))
+            check(statusText.displayedStatus == state, "all six states reach the menu renderer")
+            let fill = luminance(MenuStatusPalette.fill(state, dark: dark) ?? MenuStatusPalette.background(dark: dark))
+            check((max(text, fill) + 0.05) / (min(text, fill) + 0.05) >= 4.5, "text remains legible against each state fill")
+        }
+        check(MenuStatusPalette.fill(.idle, dark: dark) == nil, "idle restores the original transparent appearance")
+    }
+
     let surface = RoundedPanelView(frame: NSRect(x: 0, y: 0, width: 340, height: 419))
     for height: CGFloat in [419, 580, 260] {
         surface.setFrameSize(NSSize(width: 340, height: height))
