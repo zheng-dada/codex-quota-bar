@@ -138,15 +138,33 @@ private final class RPCConnection {
 }
 
 enum CodexClient {
+    private static func initialize(_ connection: RPCConnection, deadline: Date) throws {
+        _ = try connection.request(id: 1, method: "initialize", params: [
+            "clientInfo": ["name": "codex_quota_bar", "title": "Codex Quota Bar", "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.2.1"]
+        ], deadline: deadline)
+        try connection.send(["method": "initialized", "params": [:]])
+    }
+
+    static func consumeResetCredit(creditID: String?, idempotencyKey: String, customPath: String? = nil, timeout: TimeInterval = 25) throws -> ResetCreditOutcome {
+        guard !idempotencyKey.isEmpty, creditID == nil || creditID?.isEmpty == false else { throw QuotaError.invalidResponse }
+        let connection = try RPCConnection(executable: CodexLocator.find(customPath: customPath))
+        defer { connection.stop() }
+        let deadline = Date().addingTimeInterval(timeout)
+        try initialize(connection, deadline: deadline)
+        var params = ["idempotencyKey": idempotencyKey]
+        if let creditID { params["creditId"] = creditID }
+        let data = try connection.request(id: 2, method: "account/rateLimitResetCredit/consume", params: params, deadline: deadline)
+        struct Response: Decodable { let outcome: ResetCreditOutcome }
+        guard let response = try? JSONDecoder().decode(Response.self, from: data) else { throw QuotaError.invalidResponse }
+        return response.outcome
+    }
+
     static func fetch(customPath: String? = nil, timeout: TimeInterval = 25) throws -> QuotaSnapshot {
         let executable = try CodexLocator.find(customPath: customPath)
         let connection = try RPCConnection(executable: executable)
         defer { connection.stop() }
         let deadline = Date().addingTimeInterval(timeout)
-        _ = try connection.request(id: 1, method: "initialize", params: [
-            "clientInfo": ["name": "codex_quota_bar", "title": "Codex Quota Bar", "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.2.1"]
-        ], deadline: deadline)
-        try connection.send(["method": "initialized", "params": [:]])
+        try initialize(connection, deadline: deadline)
         let data = try connection.request(id: 2, method: "account/rateLimits/read", deadline: deadline)
         let response: RateLimitResponse
         do {
@@ -155,6 +173,6 @@ enum CodexClient {
             throw QuotaError.invalidResponse
         }
         guard let bucket = response.codex else { throw QuotaError.unavailableBucket }
-        return QuotaSnapshot(bucket: bucket, fetchedAt: Date(), executable: executable)
+        return QuotaSnapshot(bucket: bucket, fetchedAt: Date(), executable: executable, resetCredits: response.rateLimitResetCredits)
     }
 }

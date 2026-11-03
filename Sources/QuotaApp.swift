@@ -8,6 +8,9 @@ final class QuotaStore: ObservableObject {
     @Published private(set) var snapshot: QuotaSnapshot?
     @Published private(set) var isRefreshing = false
     @Published private(set) var error: String?
+    @Published private(set) var isUsingResetCredit = false
+    @Published private(set) var resetCreditMessage: String?
+    private var isConfirmingResetCredit = false
     @Published private(set) var activity: RunActivity
     @Published var showUsed = UserDefaults.standard.bool(forKey: "showUsed") {
         didSet { UserDefaults.standard.set(showUsed, forKey: "showUsed"); onChange?() }
@@ -60,7 +63,7 @@ final class QuotaStore: ObservableObject {
     }
 
     func refresh() {
-        guard !isRefreshing else { return }
+        guard !isRefreshing, !isUsingResetCredit, !isConfirmingResetCredit else { return }
         isRefreshing = true
         onChange?()
         let customPath = UserDefaults.standard.string(forKey: "codexPath")
@@ -77,6 +80,60 @@ final class QuotaStore: ObservableObject {
                     self.error = error.localizedDescription
                 }
                 self.onChange?()
+            }
+        }
+    }
+
+    func confirmResetCredit(_ credit: RateLimitResetCredit?) {
+        guard !isRefreshing, !isUsingResetCredit, !isConfirmingResetCredit, !needsSync,
+              let credits = snapshot?.resetCredits, credits.availableCount > 0 else { return }
+        if let credit, !credits.availableDetails.contains(where: { $0.id == credit.id }) { return }
+        isConfirmingResetCredit = true
+        let alert = NSAlert()
+        alert.messageText = "确认使用限额重置券？"
+        var detail = "确认后将消耗 1 张券，用于重置符合条件的 Codex 限额。"
+        if let credit {
+            detail += "\n\n\(credit.title ?? "限额重置券")"
+            if let expiration = credit.expirationDate {
+                detail += "\n到期：\(expiration.formatted(date: .numeric, time: .shortened))"
+            }
+        } else {
+            detail += "\n\n将由 Codex 选择一张可用券。"
+        }
+        alert.informativeText = detail
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "确认使用").keyEquivalent = ""
+        alert.addButton(withTitle: "取消").keyEquivalent = "\u{1b}"
+        let confirmed = alert.runModal() == .alertFirstButtonReturn
+        isConfirmingResetCredit = false
+        guard confirmed else { return }
+
+        isUsingResetCredit = true
+        resetCreditMessage = "正在使用重置券…"
+        onChange?()
+        // Keep the same key after an uncertain result, including across restarts.
+        let attemptID = credit?.id ?? "automatic"
+        var attempts = UserDefaults.standard.dictionary(forKey: "resetCreditAttempts") as? [String: String] ?? [:]
+        let key = attempts[attemptID] ?? UUID().uuidString
+        attempts[attemptID] = key
+        UserDefaults.standard.set(attempts, forKey: "resetCreditAttempts")
+        let customPath = snapshot?.executable.path
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = Result { try CodexClient.consumeResetCredit(creditID: credit?.id, idempotencyKey: key, customPath: customPath) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isUsingResetCredit = false
+                switch result {
+                case .success(let outcome):
+                    var saved = UserDefaults.standard.dictionary(forKey: "resetCreditAttempts") as? [String: String] ?? [:]
+                    saved.removeValue(forKey: attemptID)
+                    UserDefaults.standard.set(saved, forKey: "resetCreditAttempts")
+                    self.resetCreditMessage = outcome.message
+                case .failure(let error):
+                    self.resetCreditMessage = "未能确认使用结果：\(error.localizedDescription) 刷新后可重试同一张券。"
+                }
+                self.onChange?()
+                self.refresh()
             }
         }
     }
@@ -237,6 +294,68 @@ private struct WindowRingCard: View {
     }
 }
 
+private struct ResetCreditsCard: View {
+    @ObservedObject var store: QuotaStore
+    let credits: RateLimitResetCredits?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "ticket").foregroundStyle(.secondary)
+                Text("限额重置券").font(.system(size: 12, weight: .medium))
+                Spacer()
+                Text(credits.map { "\($0.availableCount) 张可用" } ?? "—")
+                    .font(.system(size: 13, weight: .medium)).monospacedDigit()
+            }
+            if let credits {
+                if credits.availableCount == 0 {
+                    Text("暂无可用重置券")
+                        .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                } else if credits.availableDetails.isEmpty {
+                    Text("已取得可用数量，暂未提供有效期详情")
+                        .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                    useButton(nil)
+                } else {
+                    VStack(alignment: .leading, spacing: 9) {
+                        ForEach(credits.availableDetails) { credit in
+                            HStack(spacing: 8) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(credit.title ?? "限额重置券")
+                                        .font(.system(size: 11))
+                                    if let expiration = credit.expirationDate {
+                                        Text("到期：\(expiration.formatted(date: .numeric, time: .shortened))")
+                                            .foregroundStyle(.secondary)
+                                    } else {
+                                        Text("未提供到期时间").foregroundStyle(.secondary)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                useButton(credit)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .font(.system(size: 10))
+                }
+            } else {
+                Text("暂未取得重置券信息")
+                    .font(.system(size: 10.5)).foregroundStyle(.secondary)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(12)
+        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.5))
+    }
+
+    private func useButton(_ credit: RateLimitResetCredit?) -> some View {
+        Button(credit == nil ? "使用一张" : "使用") { store.confirmResetCredit(credit) }
+            .controlSize(.small)
+            .disabled(store.isUsingResetCredit || store.isRefreshing || store.needsSync)
+            .accessibilityLabel("使用\(credit?.title ?? "限额重置券")，需要确认")
+    }
+}
+
 struct QuotaPopover: View {
     @ObservedObject var store: QuotaStore
 
@@ -271,6 +390,17 @@ struct QuotaPopover: View {
             }
             .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 14)
+
+            if let credits = store.snapshot?.resetCredits, credits.availableCount > 0 {
+                ResetCreditsCard(store: store, credits: credits)
+                    .padding(.horizontal, 14)
+            }
+
+            if let message = store.resetCreditMessage {
+                Text(message).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 20)
+            }
 
             LastRunCard(activity: store.activity)
                 .padding(.horizontal, 14)
@@ -341,11 +471,15 @@ enum MenuStatusPalette {
 
     static func background(dark: Bool) -> NSColor { color(dark ? 0x202329 : 0xF6F7F9) }
 
+    static func foreground(_ status: RunStatus) -> NSColor {
+        status == .running ? .white : .labelColor
+    }
+
     static func fill(_ status: RunStatus, dark: Bool) -> NSColor? {
         let rgb: UInt32
         switch status {
         case .idle: return nil
-        case .running: rgb = dark ? 0x163C60 : 0xD9EAFE
+        case .running: rgb = dark ? 0x1D4ED8 : 0x2563EB
         case .completed: rgb = dark ? 0x173F2C : 0xDDF2E5
         case .cancelled: rgb = dark ? 0x493D13 : 0xFFF0BC
         case .failed: rgb = dark ? 0x4F2429 : 0xFCE0E2
@@ -375,6 +509,10 @@ final class StatusTextView: NSView {
     private var labels = ["—", "—"]
     private var needsSync = false
     private var showingRate = false
+    private var hoverArea: NSTrackingArea?
+    private(set) var isHovered = false
+    private(set) var isPressed = false
+    var isPanelOpen = false { didSet { needsDisplay = true } }
     private(set) var displayedStatus: RunStatus = .idle
     var displayedLabels: [String] { labels }
 
@@ -411,8 +549,38 @@ final class StatusTextView: NSView {
         NSSize(width: 2 + leftWidth + rightWidth + syncWidth, height: NSStatusBar.system.thickness)
     }
 
-    // Leave the complete status button as the click and accessibility target.
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+        hoverArea = area
+        if let window {
+            isHovered = bounds.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil))
+            needsDisplay = true
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHovered = true; needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { isHovered = false; needsDisplay = true }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let window else { return }
+        isPressed = true
+        needsDisplay = true
+        defer { isPressed = false; needsDisplay = true }
+        while let next = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            let inside = bounds.contains(convert(next.locationInWindow, from: nil))
+            isHovered = inside
+            isPressed = inside
+            needsDisplay = true
+            if next.type == .leftMouseUp {
+                // The parent button retains its action and accessibility behavior.
+                if inside { (superview as? NSButton)?.performClick(nil) }
+                return
+            }
+        }
+    }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
@@ -429,7 +597,19 @@ final class StatusTextView: NSView {
             fill.setFill()
             border.fill()
         }
-        NSColor.labelColor.withAlphaComponent(0.30).setStroke()
+        if isPressed || isPanelOpen || isHovered {
+            let overlay: NSColor
+            if displayedStatus == .running {
+                overlay = isPressed ? NSColor.black.withAlphaComponent(0.18)
+                    : (isPanelOpen ? NSColor.black.withAlphaComponent(0.08) : NSColor.white.withAlphaComponent(0.05))
+            } else {
+                overlay = NSColor.labelColor.withAlphaComponent(isPressed ? 0.15 : (isPanelOpen ? 0.10 : 0.055))
+            }
+            overlay.setFill()
+            border.fill()
+        }
+        let foreground = MenuStatusPalette.foreground(displayedStatus)
+        foreground.withAlphaComponent(isPanelOpen ? 0.55 : (isHovered ? 0.42 : 0.30)).setStroke()
         border.lineWidth = 0.5
         border.stroke()
 
@@ -439,7 +619,7 @@ final class StatusTextView: NSView {
         divider.line(to: NSPoint(x: dividerX, y: bounds.midY + 5))
         divider.lineWidth = 0.5
         divider.lineCapStyle = .round
-        NSColor.labelColor.withAlphaComponent(0.20).setStroke()
+        foreground.withAlphaComponent(displayedStatus == .running ? 0.35 : 0.20).setStroke()
         divider.stroke()
 
         for index in labels.indices {
@@ -447,7 +627,7 @@ final class StatusTextView: NSView {
             drawLabel(labels[index], centerX: centerX, color: metricColor(values[index]))
         }
         if needsSync {
-            drawLabel("!", centerX: bounds.minX + 1 + leftWidth + rightWidth + syncWidth / 2, color: .labelColor)
+            drawLabel("!", centerX: bounds.minX + 1 + leftWidth + rightWidth + syncWidth / 2, color: foreground)
         }
     }
 
@@ -458,10 +638,12 @@ final class StatusTextView: NSView {
     }
 
     private func metricColor(_ value: Double?) -> NSColor {
-        guard let value, value <= 20 else { return .labelColor }
+        guard let value, value <= 20 else { return MenuStatusPalette.foreground(displayedStatus) }
         let dark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
         let rgb: UInt32
-        if displayedStatus != .idle {
+        if displayedStatus == .running {
+            rgb = value < 10 ? 0xFFB4B4 : 0xFFE08A
+        } else if displayedStatus != .idle {
             if value < 10 { rgb = dark ? 0xFF9293 : 0xB1202A }
             else { rgb = dark ? 0xFFD45C : 0x7D5A00 }
         } else if value < 10 { rgb = dark ? 0xFF6961 : 0xD23536 }
@@ -566,6 +748,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = item.button {
             button.image = nil
             button.title = ""
+            // Draw interaction feedback inside the same rounded badge.
+            if let cell = button.cell as? NSButtonCell {
+                cell.highlightsBy = []
+                cell.showsStateBy = []
+            }
             statusText.frame = button.bounds
             statusText.autoresizingMask = [.width, .height]
             statusText.setAccessibilityElement(false)
@@ -657,12 +844,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         positionPanel()
         panel.makeKeyAndOrderFront(nil)
+        statusText.isPanelOpen = true
         installMonitors()
         store.refresh()
     }
 
     private func closePanel() {
         panel.orderOut(nil)
+        statusText.isPanelOpen = false
         // Hidden panels must not keep TimelineViews or store subscriptions alive.
         panelContent.rootView = AnyView(EmptyView())
         panelContent.layoutSubtreeIfNeeded()
@@ -677,7 +866,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return event }
             if event.type == .keyDown {
                 if event.keyCode == 53 && event.window === self.panel && !self.menuIsTracking { self.closePanel(); return nil }
-            } else if !self.menuIsTracking && event.window !== self.panel && event.window !== self.item.button?.window {
+            } else if !self.menuIsTracking && event.window !== self.panel && event.window !== self.item.button?.window && event.window !== NSApp.modalWindow {
                 self.closePanel()
             }
             return event

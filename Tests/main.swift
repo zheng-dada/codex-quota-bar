@@ -23,6 +23,28 @@ let legacy = try decode("""
 """)
 check(legacy.codex?.window(minutes: 300)?.remaining == 75, "legacy response")
 check(legacy.codex?.window(minutes: 10080) == nil, "missing weekly is unknown")
+check(legacy.rateLimitResetCredits == nil, "older servers leave reset credits unknown, not zero")
+let resetCredits = try decode("""
+{"rateLimitResetCredits":{"availableCount":5,"credits":[
+ {"id":"later","status":"available","expiresAt":2000000000,"title":"Reset"},
+ {"id":"used","status":"redeemed","expiresAt":1,"title":null},
+ {"id":"unknown-expiry","status":"available","expiresAt":null,"title":null},
+ {"id":"sooner","status":"available","expiresAt":1900000000,"title":null}
+]}}
+""").rateLimitResetCredits!
+check(resetCredits.availableCount == 5, "server count remains authoritative when detail rows are capped")
+check(resetCredits.availableDetails.map(\.id) == ["sooner", "later", "unknown-expiry"], "show available credits by expiration and exclude redeemed rows")
+check(resetCredits.availableDetails.last?.expirationDate == nil, "null expiration is unknown")
+let countOnly = try decode("""
+{"rateLimitResetCredits":{"availableCount":2,"credits":null}}
+""").rateLimitResetCredits!
+check(countOnly.availableCount == 2 && countOnly.availableDetails.isEmpty, "count-only response preserves quantity without inventing expiration")
+let nullResetCredits = try decode("{\"rateLimitResetCredits\":null}")
+check(nullResetCredits.rateLimitResetCredits == nil, "null reset credits remain unavailable")
+let noResetCredits = try decode("""
+{"rateLimitResetCredits":{"availableCount":0,"credits":[]}}
+""").rateLimitResetCredits!
+check(noResetCredits.availableCount == 0 && noResetCredits.availableDetails.isEmpty, "explicit zero credits is distinguished from missing data")
 let wrong = try decode("""
 {"rateLimits":{"limitId":"other","primary":{"usedPercent":20,"windowDurationMins":300}}}
 """)
@@ -51,6 +73,23 @@ check(snapshot.weekly?.remaining == 87, "real transport reads weekly")
 let methods = try String(contentsOfFile: requestLog, encoding: .utf8).split(separator: "\n").map(String.init)
 check(methods == ["initialize", "initialized", "account/rateLimits/read"], "only quota requests, no thread or turn")
 unsetenv("CODEX_QUOTA_TEST_LOG")
+
+for expected in [ResetCreditOutcome.reset, .alreadyRedeemed, .nothingToReset, .noCredit] {
+    setenv("CODEX_QUOTA_TEST_MODE", "consume-\(expected.rawValue)", 1)
+    let outcome = try CodexClient.consumeResetCredit(creditID: "test-credit", idempotencyKey: "test-retry-key", customPath: fixture)
+    check(outcome == expected, "reset outcome \(expected.rawValue) with selected credit and stable request key")
+}
+setenv("CODEX_QUOTA_TEST_MODE", "consume-alreadyRedeemed", 1)
+let retryOutcome = try CodexClient.consumeResetCredit(creditID: "test-credit", idempotencyKey: "test-retry-key", customPath: fixture)
+check(retryOutcome == .alreadyRedeemed, "retry uses the original key and recognizes a completed redemption")
+setenv("CODEX_QUOTA_TEST_MODE", "consume-reset", 1)
+let automaticOutcome = try CodexClient.consumeResetCredit(creditID: nil, idempotencyKey: "test-retry-key", customPath: fixture)
+check(automaticOutcome == .reset, "count-only accounts omit creditId for service selection")
+setenv("CODEX_QUOTA_TEST_MODE", "consume-unknown", 1)
+do {
+    _ = try CodexClient.consumeResetCredit(creditID: "test-credit", idempotencyKey: "test-retry-key", customPath: fixture)
+    check(false, "unknown redemption outcome must not report success")
+} catch QuotaError.invalidResponse { check(true, "unknown redemption result remains uncertain") }
 
 for mode in ["auth", "missing", "invalid", "exit", "timeout"] {
     setenv("CODEX_QUOTA_TEST_MODE", mode, 1)

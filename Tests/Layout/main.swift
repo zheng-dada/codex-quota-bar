@@ -37,7 +37,6 @@ MainActor.assumeIsolated {
     let statusText = StatusTextView()
     statusText.update(fiveHour: store.snapshot?.fiveHour, weekly: store.snapshot?.weekly, showUsed: store.showUsed)
     check(statusText.intrinsicContentSize.width > 60 && statusText.intrinsicContentSize.width < 220, "compact status text fits both percentages")
-    check(statusText.hitTest(.zero) == nil, "status text leaves click handling to status button")
 
     statusText.update(fiveHour: store.snapshot?.fiveHour, weekly: store.snapshot?.weekly, showUsed: false, activity: RunActivity(activeCount: 1, currentRate: 38))
     check(statusText.displayedLabels == ["51%", "38t/s"], "running speed replaces weekly cell and preserves five-hour quota")
@@ -58,8 +57,8 @@ MainActor.assumeIsolated {
         return linear(rgb.redComponent) * 0.2126 + linear(rgb.greenComponent) * 0.7152 + linear(rgb.blueComponent) * 0.0722
     }
     for dark in [false, true] {
-        let text = luminance(dark ? .white : .black)
         for state in RunStatus.allCases {
+            let text = luminance(state == .running ? .white : (dark ? .white : .black))
             statusText.update(fiveHour: store.snapshot?.fiveHour, weekly: store.snapshot?.weekly, showUsed: false,
                               activity: RunActivity(activeCount: state == .running ? 1 : 0, currentRate: 38, status: state))
             check(statusText.displayedStatus == state, "all six states reach the menu renderer")

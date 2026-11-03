@@ -37,9 +37,45 @@ struct RateLimitBucket: Codable {
     }
 }
 
+struct RateLimitResetCredit: Decodable, Identifiable {
+    let id: String
+    let status: String
+    let expiresAt: Double?
+    let title: String?
+
+    var expirationDate: Date? {
+        guard let expiresAt, expiresAt.isFinite else { return nil }
+        return Date(timeIntervalSince1970: expiresAt)
+    }
+}
+
+struct RateLimitResetCredits: Decodable {
+    let availableCount: Int
+    let credits: [RateLimitResetCredit]?
+
+    var availableDetails: [RateLimitResetCredit] {
+        (credits ?? []).filter { $0.status == "available" }
+            .sorted { ($0.expirationDate ?? .distantFuture) < ($1.expirationDate ?? .distantFuture) }
+    }
+}
+
+enum ResetCreditOutcome: String, Decodable {
+    case reset, alreadyRedeemed, nothingToReset, noCredit
+
+    var message: String {
+        switch self {
+        case .reset: return "重置券使用成功。"
+        case .alreadyRedeemed: return "这次重置已完成。"
+        case .nothingToReset: return "当前没有符合重置条件的限额，未使用重置券。"
+        case .noCredit: return "当前没有可用重置券。"
+        }
+    }
+}
+
 struct RateLimitResponse: Decodable {
     let rateLimits: RateLimitBucket?
     let rateLimitsByLimitId: [String: RateLimitBucket]?
+    let rateLimitResetCredits: RateLimitResetCredits?
 
     var codex: RateLimitBucket? {
         if let bucket = rateLimitsByLimitId?["codex"] { return bucket }
@@ -53,6 +89,7 @@ struct QuotaSnapshot {
     let bucket: RateLimitBucket
     let fetchedAt: Date
     let executable: URL
+    var resetCredits: RateLimitResetCredits? = nil
 
     var fiveHour: LimitWindow? { bucket.window(minutes: 300) }
     var weekly: LimitWindow? { bucket.window(minutes: 10_080) }

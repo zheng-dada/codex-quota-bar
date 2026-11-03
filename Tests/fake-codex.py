@@ -21,6 +21,13 @@ for line in sys.stdin:
         continue
     if request["method"] == "initialize":
         response = {"id": request["id"], "result": {"userAgent": "test"}}
+    elif request["method"] == "account/rateLimitResetCredit/consume":
+        params = request.get("params", {})
+        valid = params.get("idempotencyKey") == "test-retry-key" and params.get("creditId") in (None, "test-credit")
+        if valid:
+            response = {"id": request["id"], "result": {"outcome": mode.removeprefix("consume-")}}
+        else:
+            response = {"id": request["id"], "error": {"code": -32602, "message": "Unexpected reset parameters"}}
     elif mode == "auth":
         response = {"id": request["id"], "error": {"code": -32001, "message": "401 authentication required"}}
     else:
